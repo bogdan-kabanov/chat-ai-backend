@@ -1,14 +1,12 @@
-import OpenAI from 'openai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import { config } from '../config/env';
 import prisma from '../config/prisma';
 
-const openai = new OpenAI({
-  apiKey: config.openaiApiKey,
-});
+const genAI = new GoogleGenerativeAI(config.geminiApiKey);
 
 interface ChatMessage {
-  role: 'user' | 'assistant' | 'system';
-  content: string;
+  role: 'user' | 'model';
+  parts: { text: string }[];
 }
 
 export class ChatService {
@@ -34,7 +32,6 @@ export class ChatService {
       });
     }
 
-    // Save user message
     await prisma.message.create({
       data: {
         role: 'user',
@@ -43,31 +40,52 @@ export class ChatService {
       },
     });
 
-    // Build messages history for context
     const history: ChatMessage[] = conversation.messages.map((msg) => ({
-      role: msg.role as 'user' | 'assistant',
-      content: msg.content,
+      role: msg.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: msg.content }],
     }));
 
-    history.push({ role: 'user', content: message });
-
     try {
-      const completion = await openai.chat.completions.create({
-        model: 'gpt-3.5-turbo',
-        messages: [
-          {
-            role: 'system',
-            content: 'You are a helpful assistant. Respond concisely and clearly.',
-          },
-          ...history,
-        ],
-        max_tokens: 1000,
-        temperature: 0.7,
-      });
+      const models = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
+      let reply = '';
 
-      const reply = completion.choices[0]?.message?.content || 'No response received';
+      let lastError: any = null;
 
-      // Save assistant message
+      for (const modelName of models) {
+        try {
+          const model = genAI.getGenerativeModel({ model: modelName });
+
+          const chat = model.startChat({
+            history,
+            generationConfig: {
+              maxOutputTokens: 1000,
+              temperature: 0.7,
+            },
+          });
+
+          const result = await chat.sendMessage(message);
+          const response = result.response;
+          reply = response.text() || '';
+
+          if (reply) {
+            console.log(`Successfully used model: ${modelName}`);
+            break;
+          }
+        } catch (modelError: any) {
+          lastError = modelError;
+          console.warn(`Model ${modelName} failed: ${modelError?.message || modelError}. Trying next...`);
+          continue;
+        }
+      }
+
+      if (!reply && lastError) {
+        throw lastError;
+      }
+
+      if (!reply) {
+        throw new Error('All models failed to respond. Please try again later.');
+      }
+
       await prisma.message.create({
         data: {
           role: 'assistant',
@@ -78,16 +96,23 @@ export class ChatService {
 
       return { reply, conversationId: conversation.id };
     } catch (error: any) {
-      if (error?.status === 401) {
-        throw Object.assign(new Error('Invalid OpenAI API key'), { statusCode: 401 });
+      console.error('Gemini API error:', error?.message || error);
+
+      if (error?.message?.includes('API_KEY_INVALID') || error?.status === 400) {
+        throw Object.assign(new Error('Invalid Gemini API key'), { statusCode: 401 });
       }
-      if (error?.status === 429) {
+      if (error?.message?.includes('RATE_LIMIT') || error?.status === 429) {
         throw Object.assign(new Error('Rate limit exceeded. Please try again later.'), {
           statusCode: 429,
         });
       }
+      if (error?.status === 503 || error?.message?.includes('503')) {
+        throw Object.assign(new Error('All models are currently overloaded. Please try again in a minute.'), {
+          statusCode: 503,
+        });
+      }
       throw Object.assign(
-        new Error(error?.message || 'Failed to get response from ChatGPT'),
+        new Error(error?.message || 'Failed to get response from AI'),
         { statusCode: 502 }
       );
     }
